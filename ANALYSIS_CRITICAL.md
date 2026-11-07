@@ -149,4 +149,34 @@ go test -run 'TestPocStaticcallEscape' -v ./ledger/vm/
 
 ---
 
-*Nota: este documento y el PoC se prepararon sobre el checkout local; no se modificó código de producción ni se ejecutó contra redes/mainnet de terceros. Todo el análisis es estático sobre el repositorio y una simulación local de la lógica de pila/memoria.*
+## 7. Empeoramiento del #23d: contrato "vampiro" multi-víctima
+
+El #23d requiere que la víctima tenga un contrato que haga `STATICCALL` al atacante. El siguiente escalón es un **contrato vampiro**: una sola deployment del atacante drena a **cualquier persona que invoque una función pública del contrato** (una `view`, un `airdrop`, una "recompensa", un callback de oráculo, ERC-165…), sin que la víctima necesite un contrato preparado con antelación.
+
+El bytecode del vampiro usa `CALLER` (0x33) en lugar de una dirección hardcodeada:
+
+```
+CALLER; MUL 2^96; MSTORE@0              → mem[0:20] = quien llama
+STATICCALL 0xC9(mem[0:20])              → mem[64:96] = thetawei(quien llama)  [readOnly]
+MSTORE@0: dirección del atacante        → mem[0:20] = atacante (recipient)
+MLOAD(64); MSTORE@20                    → mem[20:52] = amount leído en vivo
+DELEGATECALL 0xCB(mem[0:52])            → drena a quien llama, paga al atacante
+STOP
+```
+
+Cada víctima que invoque el contrato pierde el 100 % de su THETA (`err == nil`). El atacante acumula el botín de todas las víctimas con una sola deployment. Archivo: `ledger/vm/poc_vampire_multivictim_test.go` (`TestPocVampireMultiVictimDrainVictim1/2`).
+
+## 8. ¿Existe algo más crítico que NO requiera interacción de la víctima?
+
+**No se encontró.** La superficie sin-interacción-de-víctima está cerrada en este commit:
+
+- En el nivel top-level de una transacción (`evm.Call`, `evm.StaticCall`, `evm.DelegateCall`), `CallerAddress` siempre es `caller.Address()`, esto es, el firmante de la tx. Un atacante solo puede debitar su propio balance desde una tx que él firma.
+- Los precompiles mutables no ejecutan bytecode, así que no hay reentrancia entre ellos.
+- Split rules, service payments y coinbase **no ejecutan bytecode de contratos**, por tanto no hay path automático que invoque código de terceros sin una transacción de usuario.
+- `enforceRestrictions` bloquea `SSTORE`/`LOG`/`SELFDESTRUCT` en `readOnly`, y el escape de solo-lectura está restringido a los precompiles mutables (que necesitan `CallerAddress = víctima`).
+
+Por tanto, el **techo del exploit** en este commit es el #23d (y su versión vampiro): robo del 100 % de THETA/TFUEL de una víctima desde un contexto read-only, con cero firma de drenaje, y escalable a N víctimas con un solo contrato atacante. Sin interacción de la víctima no es posible drenar fondos de terceros.
+
+---
+
+*Nota: este documento y los PoC se prepararon sobre el checkout local; no se modificó código de producción ni se ejecutó contra redes/mainnet de terceros. Todo el análisis es estático sobre el repositorio y una simulación local de la lógica de pila/memoria ejecutada con éxito (simulador reproduce el drenaje 100 % THETA, err == nil, cero firma de víctima).*
