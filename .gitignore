@@ -4,3 +4,6 @@ vendor/
 local/
 p2p/messenger/.addrbooks
 p2p/messenger/db/
+
+# Clon local de todo el ecosistema Theta (ver theta-ecosystem/) — no versionar los repos anidados
+/theta-ecosystem/repos
