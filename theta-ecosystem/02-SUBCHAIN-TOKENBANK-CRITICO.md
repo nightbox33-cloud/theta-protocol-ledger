@@ -139,3 +139,63 @@ permissionless, así que esa condición puede aparecer sin que nadie lo impida.
 4. Como defensa en profundidad: exigir un mínimo de shares/votantes distintos
    (p. ej. `require(vd.signers.length >= 2)`) para que ninguna subchain con un
    único staker pueda aprobar transfers salientes.
+
+---
+
+# Ronda 2 — búsqueda de un vector sin phishing (resultado: negativo, con lo verificado)
+
+Objetivo de esta ronda: encontrar robo **sin interacción de la víctima**. Todo lo
+siguiente se leyó en código y se descartó con el motivo concreto.
+
+## Lo nuevo que sí aparece
+
+**`TNT721TokenBank.unlockTokens` es el gemelo exacto del fallo de TNT-20.**
+También tiene el cap comentado:
+
+```solidity
+// require(
+//     totalLockedAmounts[sourceChainID][targetChainTNT721Contract][tokenID] == 1,
+//     "Cannot unlock the requested tokenID"
+// );
+```
+
+Mismo patrón (denom del llamante, `sourceChainID` no ligado, digest forjable, cap
+comentado). Es una **instancia nueva del mismo primitivo**, no un vector nuevo:
+mismo coste de 10.000 wTHETA y misma barrera de quórum. `TNT1155TokenBank`
+sigue el mismo esquema.
+
+## Descartado con evidencia en esta ronda
+
+| Hipótesis | Veredicto | Prueba |
+|---|---|---|
+| **Doble conteo de votos en consenso** — `HasMajorityVotes` suma stake por cada entrada de la lista y no deduplica; `AddVote` usa clave `ID:Block:Epoch`, así que un validador puede tener N entradas | **Cerrado** | `consensus/state.go:219-228`: `AddEpochVote` aplica `UniqueVoter()` al ingerir, así que el set persistido tiene como máximo un voto por ID. En `engine.go:1154` y `CommitCertificate.IsValid` se aplica además `UniqueVoter()`. Los sitios sin deduplicar (1048, 1371) leen ese set ya deduplicado. |
+| `SplitRule` secuestrado por `resourceID` ajeno, `Duration` sin tope | Real pero **descartado por el usuario**: apagado en mainnet | — |
+| `WithdrawStake` roba stake ajeno | No | `WithdrawStake(source, holder)` → `StakeHolder.withdrawStake` sólo casa `stake.Source == source` |
+| Inputs negativos en `ServicePaymentTx` vacían el reserved fund | No | `TxInput.ValidateBasic` → `Coins.IsValid()` → `IsNonnegative()` |
+| Firma nula en el `Target` de un service payment | No | `crypto.Signature.Verify`: `if sig == nil \|\| sig.IsEmpty() { return false }` |
+| `sanityCheck` sin verificar firma del `SlashedAddress` | Real, pero **requires ser validador** y hoy `reserved_funds` está vacío en los 15 mayores holders |
+| `bigModExp` (0x05) con `modLen`/`baseLen` enormes → pánico u OOM | No | `RequiredGas` cuadrático en `max(modLen, baseLen)`; si excede, `MaxUint64Val` → OOG |
+| Reconstrucción de `bytecode` de `wTHETA` adulterada por el explorer | No | `code` on-chain = keccak(runtime) = `0x1b202d37…`, y la fuente verificada es coherente con la ABI y con los precompiles 0xC9/0xCB |
+| `TDropStaking` con inflación de primera posición | No | `totalShares ≫ 0` en vivo; redondeo a favor del pool |
+
+## Por qué no hay vector sin interacción en el core
+
+El core no tiene una superficie donde un tercero mueva fondos de otra cuenta sin
+una firma de esa cuenta o sin ser validador. Todos los caminos de movimiento de
+saldo (`tx_send`, `tx_withdraw_stake`, `tx_release_fund`, `tx_service_payment`,
+`tx_slash`) exigen o bien la firma del dueño del saldo, o bien privilegio de
+validador. El único punto donde el ledger toca saldo de terceros sin esa firma es
+el `CoinbaseTx`, y está atado al proposer del bloque.
+
+**Prueba negativa explícita**: no encontré, en el core, ninguna ruta en la que
+`sourceAccount` de una transacción sea distinta de la cuenta cuya firma se
+verifica. `validateInputAdvanced` siempre verifica `in.Signature` contra
+`acc.Address` de esa misma entrada.
+
+## Nota de alcance
+
+No probé payloads de inyección contra la API del explorer de producción: leer sus
+endpoints GET públicos es usar la API, pero enviarle explotación sería test no
+autorizado contra un servicio de terceros. Si se quiere cubrir ese frente, hay
+que hacerlo sobre una instancia local del backend (`explorer-api`, Node.js +
+Mongo), que sí es auditable sin tocar producción.
