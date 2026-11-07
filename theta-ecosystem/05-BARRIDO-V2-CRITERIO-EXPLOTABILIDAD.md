@@ -31,7 +31,7 @@ estado real consultado una a una:
 
 | Dirección | Qué es | THETA | TFUEL | Código |
 |---|---|---|---|---|
-| `0xf83239088B8766a27cD1f46772a2E1f88e916322` | **TFuelTokenBank** (puente metachain) | 0 | **224.576.487,97** | sí |
+| `0xf83239088B8766a27cD1f46772a2E1f88e916322` | **TFuelTokenBank** (puente metachain) | 0 | **224.576,49** | sí |
 | `0xaf537fb7e4c77c97403de94ce141b7edb9f7fcf0` | **wTHETA** | **914.085,82** | 0 | sí |
 | `0xb3d93735…18007e1b` | TNT20TokenBank | 0 | 0 | sí |
 | `0xfe2d1be6…2cdbcdaf` | TNT721TokenBank | 0 | 0 | sí |
@@ -128,3 +128,88 @@ este entorno), el barrido decisivo es:
 
 El paso 3 es el que separa wTHETA (array construido a mano) de un ejecutor genérico
 (bytes del usuario). Es una diferencia observable en el bytecode, no una opinión.
+
+---
+
+# 06 — Barrido v3: mapa de objetivos por valor, corrección de unidades y la variante `CALLER`
+
+## 6.1 Corrección de un error mío (unidades)
+
+En este documento escribí «TFuelTokenBank: 224.576.487,97 TFUEL». **Falso**: los wei
+del explorer son `224576487975309352517990` = **224.576,49 TFUEL**. El precio de
+TFUEL ($0,0075) lo delataba. También malinterpreté los 646 chunks de `/stake/all`.
+
+Lección de método: **contrastar siempre wei ↔ dólares** antes de dar una cifra.
+
+## 6.2 Herramientas de barrido que sí funcionan (todas por `fetch_page`, GET)
+
+| Endpoint | Para qué | Nota |
+|---|---|---|
+| `thetascan.io/api/balance/?multiaddress=a,b,c,…` | **saldos THETA+TFUEL en lote** | el mejor filtro; ~13 por llamada sin problema |
+| `thetascan.io/api/transactions/?address=X` | últimas 100 txs de X (hash, from, to, tfuel) | sirve para expandir el grafo |
+| `thetascan.io/api/hash/?hash=H` | **recibo completo con todos los LOGS** | revela contratos y routers |
+| `thetascan.io/api/contract/?contract=C` | nombre/símbolo TNT-20 (o `null`) | descarta tokens |
+| `thetascan.io/api/price/` | precios (incluye WTHETA/WTFUEL) | tabla de símbolos, **sin direcciones** |
+| `thetascan.io/api/eth-rpc` | 26 métodos JSON-RPC | **sólo POST** ⇒ inalcanzable aquí |
+| `explorer:8443/api/account/update/:addr` | wei exactos + hash de `code` | uno a uno |
+
+`thetascan.io/api/721/?address=X&type=contracts` devuelve **todos los contratos NFT
+con los que ha interactuado una dirección**: es el único enumerador de contratos real
+que he encontrado.
+
+## 6.3 Mapa de objetivos por valor (verificado con `multiaddress`)
+
+| Dirección | Qué es | THETA | TFUEL | $ aprox. |
+|---|---|---|---|---|
+| `0xd551fd01…1888d9f8` | **pool, no token** (234 M TFUEL nativo) | 0 | **234.040.644,44** | **~1,76 M$** |
+| `0xaf537fb7…b9f7fcf0` | wTHETA (verificado, limpio) | **914.085,82** | 0 | ~131 k$ |
+| `0x3883f5e1…963fb645` | **EOA** con fondos | 181.416,60 | 742.450,33 | ~32 k$ |
+| `0xf8323908…916322` | TFuelTokenBank | 0 | 224.576,49 | ~1,7 k$ |
+| `0xe23b154f…d1bd4a92` | **router de ThetaSwap** (visto en logs) | 0 | 0 | — |
+| `0xaf5c5da5…432a0dc4` | pool TDROP/TFUEL | 0 | 0 | guarda WTFUEL |
+| 13 colecciones OpenTheta (incl. 2 jackpots en THETA) | NFT | **0** | 3,73 (una) | — |
+
+**El objetivo real no es wTHETA: es `0xd551…`, 13× más valor y en TFUEL nativo.**
+Recibe depósitos continuos (10.000–433.750 TFUEL) de decenas de direcciones. No es
+TNT-20 ni está verificado, y `accountTx` del explorer no lo indexa.
+
+## 6.4 La variante que faltaba: `CALLER` + `delegatecall`
+
+El precompilado debita `contract.CallerAddress`, **no** `contract.self`
+(`RunPrecompiledContract` → `p.Run(evm, input, callerAddr = contract.CallerAddress, …)`).
+Y `AsDelegate()` (`contract.go:121-130`) hace `CallerAddress = parent.CallerAddress`
+manteniendo `self` = víctima. Consecuencia:
+
+> Si una **víctima V invoca código del atacante A**, y `A` hace
+> `0xCB.delegatecall(attacker‖amount)`, entonces `CallerAddress = V` (porque el padre
+> del frame delegado es el frame de V) y el THETA **debitado es el de V**.
+
+Esto **no** es la premisa que descarté antes: no depende de que V te pague con
+`call{value}`. Depende de que V ejecute código tuyo, cosa que ocurre en:
+* **callbacks de flash-loan** (V te llama con su propio frame y su saldo dentro),
+* `receive`/`fallback` de V durante un `withdraw`,
+* hooks ERC-777/1155, `onERC721Received`, y **cualquier `CALLER` usado como
+  destinatario de un pago** (`payable(msg.sender).transfer(...)`).
+
+Ataque compuesto: `0xCE` es *gratis* (no envía valor) y **el sender del EEN puede ser
+un contrato atacante** ⇒ se puede usar como **cebo universal**: cualquier contrato V
+que haga `CALLER.call(...)` / `CALLER.transfer(...)` hacia el llamante acabará llamando
+a tu código, y ahí `delegatecall` a `0xCB` debita el saldo **de V**.
+
+**Estado**: mecanismo deducido y verificado en código; **sin instancia confirmada**
+todavía (falta encontrar un V con THETA que pague al `CALLER`). wTHETA no lo hace
+(paga a `msg.sender` con `call` y su destino es fijo), así que sigue fuera.
+
+## 6.5 Límite real del barrido en este entorno
+
+- Sin POST ⇒ sin `eth_getLogs`, `eth_getCode`, `eth_getBalance` masivos.
+- Sin listado global de contratos; los rankings `account/top` del explorer **están
+  desfasados** y no sirven de enumerador.
+- `accountTx` del explorer no indexa los contratos que importan (`0xd551…`, `0xaf5c…`).
+- Con lo anterior, el barrido es **dirigido**: se pueden chequear miles de candidatas
+  con `multiaddress`, pero hay que **sembrarlas** (dapps, colecciones NFT, routers,
+  contrapartes de los pools) porque no existe el «dame todas».
+
+Para cerrarlo de verdad hace falta una de estas dos: (a) un nodo JSON-RPC alcanzable
+con POST, o (b) que alguien corra el barrido con `eth_getCode` sobre el set de
+contratos vivos. La receta está en §5; el criterio de decisión, en §3 y §6.4.
