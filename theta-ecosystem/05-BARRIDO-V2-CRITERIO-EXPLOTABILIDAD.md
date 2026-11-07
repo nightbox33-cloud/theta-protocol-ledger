@@ -213,3 +213,79 @@ todavía (falta encontrar un V con THETA que pague al `CALLER`). wTHETA no lo ha
 Para cerrarlo de verdad hace falta una de estas dos: (a) un nodo JSON-RPC alcanzable
 con POST, o (b) que alguien corra el barrido con `eth_getCode` sobre el set de
 contratos vivos. La receta está en §5; el criterio de decisión, en §3 y §6.4.
+
+---
+
+# 07 — El requisito real del ataque (y por qué este entorno no puede cerrarlo)
+
+## 7.1 Los RPC existen; el sandbox no los alcanza
+
+El usuario verificó 4 endpoints que **sí** sirven para `eth_getCode` por POST:
+`eth-rpc-api.thetatoken.org/rpc`, `eth-rpc-api.thetatoken.org`,
+`www.thetascan.io/api/eth-rpc`, `361.rpc.thirdweb.com` (chainId 361 = `0x169`).
+
+En este sandbox los cuatro fallan en `SSL_connect` (`SSL_ERROR_SYSCALL`, HTTP 000)
+igual que antes: no es que Theta esté caído, es la **allowlist de red** del entorno
+(sólo github/npm/pypi). Además `fetch_page` hace GET y sin cabecera JSON, así que:
+- `361.rpc.thirdweb.com` por GET devuelve su **web**, no JSON-RPC;
+- `eth-rpc` de thetascan rechaza con «invalid content type, only application/json».
+
+⇒ El barrido con `eth_getCode`/`eth_getBalance` masivo **lo tiene que correr el
+usuario**. El script queda listo: `theta-ecosystem/07-sweep-theta-rpc.py`.
+
+## 7.2 El hallazgo que cambia el requisito
+
+El precompilado usa `contract.CallerAddress` (`RunPrecompiledContract`,
+`contracts.go:100-107`). Y `Contract.Address()` devuelve `c.self`
+(`contract.go:164-166`). Combinando con `AsDelegate()` (`contract.go:121-130`):
+
+| vía | `CallerAddress` en el frame del precompilado | quién ejecuta |
+|---|---|---|
+| `CALL` / `STATICCALL` a `0xCB` | **el propio contrato víctima** | la víctima |
+| `DELEGATECALL` a `0xCB` desde código del atacante | `parent.CallerAddress` = **la víctima** | el atacante |
+
+De ahí, el requisito real del ataque:
+
+> La víctima V debe hacer **una llamada con valor CERO** a código del atacante.
+> Ese código ejecuta `0xCB.delegatecall(attacker‖amount)`.
+> `msg.value = 0` ⇒ `CanTransfer` pasa trivialmente y `TransferTheta` no mueve nada,
+> pero `CallerAddress` sigue siendo **V**.
+
+Esto **anula las dos premisas que venía usando**:
+- «la víctima tiene que pagarte con `call{value}`» ⇒ **falso**, el valor es 0;
+- «la barrera de gas de `.transfer` (2.300 < 21.000) descarta a los candidatos»
+  ⇒ **irrelevante**, no hay transferencia de valor que hacer.
+
+`.transfer`/`.send` de 2.300 gas **sí alcanzan** para entrar en código del atacante y
+hacer un `delegatecall` a un precompilado (≈1.000-1.800 gas). El `21.000` de
+`ThetaTransferGas` se paga del gas del frame, y el frame tiene todo el gas restante
+de la tx, no los 2.300 del stipend.
+
+Y `0xCE` (`stakeToEEN`) tampoco envía valor ⇒ **es un cebo ideal para provocar ese
+callback sin que la víctima gaste nada**.
+
+## 7.3 Lo que sigue cerrado (para no repetir camino)
+
+- **`0xCF`/`0xCE` no roban TFUEL**: el stake devuelto va al `Source`
+  (`ledger.go:741-743`: `sourceAccount.Balance.Plus(returnedCoins)`). Si el atacante
+  fuerza un stake desde V, sólo V puede retirarlo y cobrarlo.
+- **wTHETA** no sirve: no ejecuta código ajeno y su destino es fijo con `amount` propio.
+- **Los pools** (`0xaf5c…`, router `0xe23b…`) tienen 0 TFUEL y 0 THETA nativos.
+- El pool `0xd551…` (234 M TFUEL) no es TNT-20 ni está verificado; su interface
+  (`0x23ad6f3d`, `0x6d83fd0c`, …) hay que sacarla de calldata, no del ABI.
+
+## 7.4 Cómo se cierra en 10 minutos con el script
+
+```bash
+python3 07-sweep-theta-rpc.py --blocks 2000
+```
+
+1. `eth_getBalance` de cada candidato ⇒ descarta todo lo que no tenga THETA.
+2. `eth_getCode` ⇒ descarta EOA (la mayoría de la chain).
+3. Heurística de bytecode: `CALL`/`DELEGATECALL` con **gas desde `GAS`** y destino no
+   fijo ⇒ candidatos a ejecutor genérico.
+4. Confirmación definitiva, por candidato: `eth_call` simulando la función pública
+   del candidato **desde una cuenta atacante, con `value = 0`**, y volver a leer
+   `eth_getBalance` del candidato: si baja, está drenado.
+
+El paso 4 es la prueba; los tres anteriores sólo reducen la lista.
