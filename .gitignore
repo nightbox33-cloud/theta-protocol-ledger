@@ -4,3 +4,6 @@ vendor/
 local/
 p2p/messenger/.addrbooks
 p2p/messenger/db/
+
+# sandbox-only offline module scaffolding (not part of the audit)
+_stubs/
