@@ -1,5 +1,17 @@
 # Familia CallerAddress: inventario de contratos mainnet y por qué no hay instancia viva
 
+> ⚠️ **DOCUMENTO SUPERADO — NO CITAR.** Ver `04-MODELO-CORRECTO-Y-BARRIDO-MAINNET.md`.
+>
+> Contiene dos errores que invalidan sus conclusiones:
+> 1. Afirma que la identidad sólo se materializa con **`delegatecall`**. Es falso: en
+>    un `CALL` o un `STATICCALL` normal, `CallerAddress` del frame es igualmente el
+>    contrato víctima (`NewContract`, `contract.go:67`). Basta cualquier tipo de call.
+> 2. Las direcciones que lista como «contratos DeFi» de `frontend/src` estaban
+>    extraídas de cadenas de 64 hex truncadas a 40: son **topic hashes de eventos**,
+>    no direcciones.
+>
+> Lo único que sigue siendo válido es el hecho central: `run()` ignora `readOnly`.
+
 Objetivo: encontrar un contrato mainnet con THETA nativo que llame a `0xCB`
 (`transferTheta`) mediante **delegatecall**, de forma que `CallerAddress` herede la
 identidad del contrato y se pueda drenar su saldo sin que la víctima firme nada.
